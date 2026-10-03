@@ -1,0 +1,100 @@
+name: Automated-DJI-Streaming-Pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  media-processing:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      NGROK_AUTHTOKEN: 3K20Gthgj6N53YFoyFxzjPPVOmN_2qTbz6Q86V5CZMg4oGza6
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+    steps:
+      - name: Install ngrok and OBS Studio
+        shell: pwsh
+        run: |
+          choco install ngrok obs-studio -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cài ngrok hoặc OBS Studio thất bại."
+          }
+
+          if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
+            throw "Không tìm thấy ngrok sau khi cài."
+          }
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Thiếu GitHub Actions secret RDP_PASSWORD."
+          }
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name 'runneradmin' -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser `
+              -Name 'runneradmin' `
+              -Password $password `
+              -Description 'Temporary RDP user for this workflow'
+          } else {
+            Set-LocalUser -Name 'runneradmin' -Password $password
+          }
+
+          Enable-LocalUser -Name 'runneradmin'
+
+      - name: Create ngrok TCP config and start tunnel
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            throw "Thiếu GitHub Actions secret NGROK_AUTHTOKEN."
+          }
+
+          $configPath = Join-Path $env:RUNNER_TEMP 'ngrok.yml'
+
+          $config = @"
+          version: 3
+          agent:
+            authtoken: $env:NGROK_AUTHTOKEN
+          endpoints:
+            - name: rdp-tunnel
+              url: tcp://
+              upstream:
+                url: 3389
+          "@
+
+          [System.IO.File]::WriteAllText(
+            $configPath,
+            $config,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          ngrok config check --config $configPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "ngrok config check thất bại."
+          }
+
+          # Giữ tiến trình chạy để tunnel còn hoạt động.
+          # Xem log bước này để lấy địa chỉ tcp://... do ngrok cấp.
+          ngrok start --config $configPath --log stdout --log-format logfmt rdp-tunnel
+          if ($LASTEXITCODE -ne 0) {
+            throw "ngrok thoát với lỗi."
+          }
